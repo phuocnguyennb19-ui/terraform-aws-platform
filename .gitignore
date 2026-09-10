@@ -1,0 +1,45 @@
+# Terraform working state
+.terraform/
+.terraform.tfstate.lock.info
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Plans are binary and may contain resolved secret values — never commit one.
+*.tfplan
+tfplan
+tfplan-*
+*.tfplan.json
+
+# Variable files may carry account-specific or sensitive values by default.
+*.tfvars
+*.tfvars.json
+
+# ...with the deliberate exception of the checked-in, secret-free environment
+# inputs. These hold only environment name, region, CIDR and feature toggles.
+!environments/*/terraform.tfvars
+!*.tfvars.example
+
+# Provider lock files ARE committed on purpose — they pin provider versions and
+# checksums so CI resolves exactly what you resolved. Do not add them here.
+
+# The environment config belongs to the APPLICATION repository and is copied
+# into a clone of this one by CI. A config.yaml committed here would be one
+# application's settings living in the shared library.
+/config.yaml
+/config.yml
+/backend.hcl
+
+# Tooling output
+.tflint.d/
+checkov-report.*
+tfsec-report.*
+trivy-report.*
+.infracost/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

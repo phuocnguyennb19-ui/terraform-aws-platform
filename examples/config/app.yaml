@@ -1,0 +1,151 @@
+# ===========================================================================
+# APPLICATION STACK — one ECS service, its own Terraform state
+#
+# Every base module is disabled. What this stack needs but does not own is named
+# under `existing:` by NAME and TAG, never by a raw ID: an ID is opaque,
+# environment specific and silently wrong the moment this file is copied to
+# another environment, while a tag lookup that finds nothing fails the plan.
+#
+# Separate state on purpose. A deploy of this service must not be able to plan a
+# change to the VPC, and a base change must not wait on an application deploy.
+# ===========================================================================
+
+global:
+  project: platform
+  environment: dev
+  region: ap-southeast-1
+  owner: payments-team
+  cost_center: engineering-dev
+  assume_role_arn: null
+  tags:
+    Stack: api
+
+# ---------------------------------------------------------------------------
+# Nothing shared is built here
+#
+# Every module defaults to disabled — locals.tf reads each one as
+# `try(config.<module>.enabled, false)`. A module this stack does not build is
+# simply absent from this file; there is no `enabled: false` to write. Only what
+# is present below is created.
+# ---------------------------------------------------------------------------
+
+cloudwatch:
+  enabled: true               # the service's own alarms and their SNS topic
+  log_retention_days: 30
+
+# ---------------------------------------------------------------------------
+# What the base stack owns
+#
+# These names come from the base stack's outputs: vpc_id, ecs_cluster_name,
+# alb_target_group_arns, kms_key_arns. Read them with
+# `terraform output -json` against the base state, or from its outputs in CI.
+# ---------------------------------------------------------------------------
+
+existing:
+  vpc:
+    name_tag: platform-dev
+
+  private_subnets:
+    tags:
+      Tier: private
+
+  ecs_security_group:
+    name: platform-dev-ecs
+
+  ecs_cluster:
+    name: platform-dev-ecs
+
+  alb:
+    name: platform-dev-alb
+    # Keys here become the keys an ecs_services entry names in target_group_key.
+    target_group_names:
+      app: platform-dev-app
+
+  # By alias, not by key ID: an alias survives a key replacement, an ID does not.
+  kms_aliases:
+    logs: alias/platform-dev-logs
+    secrets: alias/platform-dev-secrets
+
+# ---------------------------------------------------------------------------
+# The service
+#
+# One entry per service. Adding a second here does not touch the first one's
+# task definition — each is its own module instance.
+# ---------------------------------------------------------------------------
+
+ecs_services:
+  api:
+    # Fargate accepts only fixed CPU values, each with its own memory range. An
+    # invalid pair is rejected by the API minutes into an apply; the module
+    # validates it at plan time instead.
+    cpu: 512
+    memory: 1024
+    cpu_architecture: X86_64      # ARM64 is ~20% cheaper and needs an arm64 image
+    desired_count: 2
+
+    # Indexes existing.alb.target_group_names above — or, in a stack that builds
+    # its own ALB, alb.target_groups.
+    target_group_key: app
+    load_balancer_container: api
+    load_balancer_port: 8080
+
+    # Raise this above the application's real cold start. Set too low, a slow
+    # boot is killed by the health check and restarted forever without ever
+    # going healthy.
+    health_check_grace_period_seconds: 60
+
+    autoscaling:
+      enabled: true
+      min: 2                      # below 2 there is no redundancy and every deploy is an outage
+      max: 10                     # a cost control as much as a capacity one
+      cpu_target: 70
+      memory_target: 70
+
+    # Every ARN a container references under `secrets:` must appear here, or the
+    # task fails to start: the EXECUTION role fetches secrets before the
+    # container runs, so this grant belongs to it, not to the task role.
+    task_exec_secret_arns:
+      - "arn:aws:secretsmanager:ap-southeast-1:111122223333:secret:platform/dev/api-*"
+
+    # The application's own AWS permissions. Empty is the right default — a
+    # workload that needs nothing from AWS should be granted nothing.
+    tasks_iam_role_statements: []
+
+    containers:
+      api:
+        # A digest or an immutable tag. `:latest` is rejected by the module:
+        # it makes the running version unknowable and the rollback a guess.
+        image: 111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/api:v1.4.2
+        essential: true
+
+        port_mappings:
+          - containerPort: 8080
+            protocol: tcp
+
+        environment:
+          - name: APP_ENV
+            value: dev
+          - name: LOG_LEVEL
+            value: info
+
+        # Injected at task start from Secrets Manager. A credential placed in
+        # `environment:` instead is stored in the task definition in plaintext,
+        # readable by anyone with ecs:DescribeTaskDefinition.
+        secrets:
+          - name: DATABASE_URL
+            valueFrom: "arn:aws:secretsmanager:ap-southeast-1:111122223333:secret:platform/dev/api-AbCdEf:DATABASE_URL::"
+
+        # Decides whether ECS restarts the container. Distinct from the ALB
+        # health check, which decides whether traffic is sent to it — a service
+        # behind a load balancer wants both.
+        health_check:
+          command: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+          interval: 30
+          timeout: 5
+          retries: 3
+          startPeriod: 60
+
+        # readonly_root_filesystem defaults to true. A process needing scratch
+        # space gets a mount point, not a writable root:
+        #
+        # readonly_root_filesystem: false
