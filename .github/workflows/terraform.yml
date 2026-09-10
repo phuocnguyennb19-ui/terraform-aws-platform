@@ -34,14 +34,14 @@ jobs:
       - name: format
         run: make fmt-check
 
-      - name: version constraints are consistent
-        run: make versions-check
+      - name: initialise without a backend
+        run: make init-local
 
-      - name: environment roots have not diverged
-        run: make env-drift
+      - name: validate
+        run: make validate
 
-      - name: validate every environment
-        run: make validate-all
+      - name: every environment config parses
+        run: make config-check
 
   lint:
     name: tflint
@@ -106,15 +106,15 @@ jobs:
           terraform_wrapper: false
 
       - name: init
-        run: make init ENV=${{ matrix.environment }}
+        run: make init CONFIG=environments/${{ matrix.environment }}/config.yaml
 
       - name: plan
-        run: make plan ENV=${{ matrix.environment }}
+        run: make plan CONFIG=environments/${{ matrix.environment }}/config.yaml
 
       # The plan file itself is not uploaded as an artifact: a saved plan
       # contains resolved values, and anyone who can download a build artifact
       # could read them.
       - name: summarise the plan
         run: |
-          make show ENV=${{ matrix.environment }} \
+          make show CONFIG=environments/${{ matrix.environment }}/config.yaml \
             | tail -50 >> "$GITHUB_STEP_SUMMARY"

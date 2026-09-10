@@ -42,25 +42,28 @@ Architecture diagrams: [`docs/architecture.md`](docs/architecture.md).
 
 ## Quick start
 
+One root, one config file per environment. The environment is not a flag — it is
+`global.environment` inside the config, and every target prints it before acting.
+
 ```bash
 # 1. State backend has to exist before the first apply. Prints the commands:
-make bootstrap-state ENV=dev
+make bootstrap-state CONFIG=environments/dev/config.yaml
 
 # 2. Put the bucket and lock table you just created into environments/dev/backend.hcl,
-#    then edit environments/dev/terraform.tfvars.
+#    then edit environments/dev/config.yaml.
 
-# 3. The normal loop. ENV is required on every target — there is no default.
-make init  ENV=dev
-make plan  ENV=dev      # writes environments/dev/tfplan-dev
-make apply ENV=dev      # applies that saved plan, then deletes it
+# 3. The normal loop. CONFIG is required on every target — there is no default.
+make init  CONFIG=environments/dev/config.yaml
+make plan  CONFIG=environments/dev/config.yaml    # writes ./tfplan
+make apply CONFIG=environments/dev/config.yaml    # applies that saved plan, then deletes it
 
-make output ENV=dev
+make output
 ```
 
 Checks that need no AWS credentials:
 
 ```bash
-make ci     # fmt-check + versions-check + env-drift + validate-all
+make ci     # fmt-check + init-local + validate + config-check
 ```
 
 ---
@@ -235,7 +238,7 @@ through **Session Manager**, which the instance role already allows — no key p
 inbound rule, no bastion, and every session recorded in CloudTrail:
 
 ```bash
-make output ENV=dev            # prints ec2_session_manager_commands
+make output                    # prints ec2_session_manager_commands
 aws ssm start-session --target i-0123456789abcdef0
 ```
 
@@ -349,7 +352,7 @@ Two consequences worth knowing:
 Check what an environment actually has switched on:
 
 ```bash
-make output ENV=dev     # includes enabled_workloads
+make output             # includes enabled_workloads
 ```
 
 ---
@@ -358,17 +361,22 @@ make output ENV=dev     # includes enabled_workloads
 
 ### The environments are one configuration
 
-`main.tf`, `variables.tf`, `outputs.tf`, `providers.tf`, `backend.tf` and `versions.tf` are
-**byte-identical** in all three environments. Only `terraform.tfvars` and `backend.hcl`
-differ. This is enforced, not just intended:
+There is exactly **one** root. All three environments run the same `main.tf`, so they cannot
+drift apart: an environment is a `config.yaml` and a `backend.hcl`, nothing more.
 
-```bash
-make env-drift        # fails if the three roots have diverged
-make versions-check   # fails if a versions.tf has drifted from the canonical one
+```
+environments/dev/
+  config.yaml     ← every value that makes dev different
+  backend.hcl     ← which state this config writes
 ```
 
-Why it matters: staging is a rehearsal for prod. If staging is structurally different, a
-procedure that works there proves nothing about prod.
+Why it matters: staging is a rehearsal for prod. If staging were structurally different, a
+procedure that works there would prove nothing about prod. Sharing one root is what makes
+that guarantee structural rather than a check someone has to remember to run.
+
+```bash
+make config-check     # parses every environment config and prints what it would build
+```
 
 ### What the environments actually differ in
 
@@ -388,9 +396,9 @@ procedure that works there proves nothing about prod.
 ### Deploying
 
 ```bash
-make init  ENV=staging
-make plan  ENV=staging     # read the plan
-make apply ENV=staging     # applies the saved plan file, not a fresh one
+make init  CONFIG=environments/staging/config.yaml
+make plan  CONFIG=environments/staging/config.yaml    # read the plan
+make apply CONFIG=environments/staging/config.yaml    # applies the saved plan file
 ```
 
 `apply` deliberately requires a plan file written by `plan`. A bare `terraform apply` plans
@@ -438,7 +446,7 @@ dynamodb_table = "terraform-locks"
 ```
 
 A committed bucket/key pair is how a dev apply ends up writing prod state. Keeping the
-values in a per-environment file that `make init ENV=<env>` selects makes that mistake
+values in a per-environment file that `make init CONFIG=<path>` selects makes that mistake
 require effort.
 
 ### Locking is not optional
@@ -453,7 +461,7 @@ There is no recovery beyond restoring a previous version and reconciling by hand
 ### Bootstrapping
 
 The bucket and table are chicken-and-egg — they must exist before the first apply.
-`make bootstrap-state ENV=dev` prints the commands, with versioning, KMS encryption and a
+`make bootstrap-state CONFIG=environments/dev/config.yaml` prints the commands, with versioning, KMS encryption and a
 public access block.
 
 ### Treat state as sensitive
@@ -482,7 +490,7 @@ anyone has to remember.
 Reading the database password:
 
 ```bash
-make output ENV=prod          # gives rds_master_user_secret_arn — an ARN, not a credential
+make output                   # gives rds_master_user_secret_arn — an ARN, not a credential
 ```
 
 Grant the application's IAM role `secretsmanager:GetSecretValue` **scoped to that ARN** and
@@ -505,10 +513,10 @@ validation block rejects it.
 
 ### Defence in depth
 
-`.gitignore` excludes `*.tfvars` by default, re-including only the three committed,
-secret-free environment files. `.pre-commit-config.yaml` runs `gitleaks` and
-`detect-private-key`. Both are a last line of defence — the real protection is that no
-module accepts a credential as an input.
+`.gitignore` excludes `*.tfvars` and every state and plan file. Environment inputs are
+`environments/<env>/config.yaml` — committed on purpose, and secret-free by construction.
+`.pre-commit-config.yaml` runs `gitleaks` and `detect-private-key`. Both are a last line of
+defence — the real protection is that no module accepts a credential as an input.
 
 ---
 
@@ -516,41 +524,35 @@ module accepts a credential as an input.
 
 ```
 terraform-aws-platform/
-├── modules/                    reusable, environment-agnostic, no provider blocks
-│   ├── vpc/                    ── Foundation
-│   ├── security-groups/
-│   ├── iam/
-│   ├── kms/
-│   ├── alb/                    ── Shared services
-│   ├── route53/
-│   ├── acm/
-│   ├── ecr/
-│   ├── cloudwatch/
-│   ├── eks/                    ── Workloads
-│   ├── ec2/
-│   ├── rds/
-│   ├── elasticache/
-│   └── lambda/
+├── main.tf                      the one root — every module call lives here
+├── locals.tf                    the one place YAML becomes Terraform
+├── data.tf                      lookups for resources this stack does not own
+├── alarms.tf                    CloudWatch alarms and the dashboard
+├── variables.tf                 two inputs: config_file and tags
+├── outputs.tf · providers.tf · versions.tf · backend.tf
 │
-├── environments/
+├── environments/                values only — no .tf here, by design
 │   ├── dev/
-│   │   ├── main.tf             ─┐
-│   │   ├── variables.tf         │ byte-identical across all three
-│   │   ├── outputs.tf           │ environments — `make env-drift`
-│   │   ├── providers.tf         │ fails if they diverge
-│   │   ├── backend.tf           │
-│   │   ├── versions.tf         ─┘
-│   │   ├── terraform.tfvars     ← environment values
-│   │   └── backend.hcl          ← state location
+│   │   ├── config.yaml          ← every value that makes dev different
+│   │   └── backend.hcl          ← which state this config writes
 │   ├── staging/
 │   └── prod/
 │
+├── examples/config/
+│   ├── base.yaml                a foundation stack
+│   └── app.yaml                 an application stack consuming one
+│
 ├── docs/architecture.md         diagrams and traffic flows
-├── versions.tf                  canonical version constraints
-├── terraform.tfvars.example
 ├── Makefile
 ├── .tflint.hcl · trivy.yaml · .checkov.yaml · .pre-commit-config.yaml
 └── .github/workflows/terraform.yml
+```
+
+Modules are **not** in this repository. They come from the
+[`terraform-module`](../terraform-module) library, pinned by tag:
+
+```hcl
+source = "git::https://github.com/phuocnguyennb19-ui/terraform-module.git//modules/vpc?ref=v1.0.0"
 ```
 
 ---
@@ -599,7 +601,7 @@ Secrets Manager.
 Route53 ──▶ ALB ──▶ EKS / EC2 ──▶ RDS + ElastiCache
 ```
 
-`environments/prod/terraform.tfvars` is a worked example of scenario E.
+`environments/prod/config.yaml` is a worked example of scenario E.
 
 ---
 
@@ -633,9 +635,8 @@ off in a hurry, by someone chasing an unrelated failure at 03:00.
 ```bash
 make fmt            # terraform fmt -recursive
 make fmt-check      # CI gate
-make validate-all   # every environment
-make env-drift      # the three roots have not diverged
-make versions-check # version constraints are consistent
+make validate       # the root configuration
+make config-check   # every environment config parses and names its environment
 make lint           # tflint  — invalid instance types, unpinned sources, undocumented vars
 make sec            # trivy config — the maintained successor to tfsec
 make checkov        # checkov

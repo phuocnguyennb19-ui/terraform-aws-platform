@@ -16,9 +16,8 @@ tfplan-*
 *.tfvars
 *.tfvars.json
 
-# ...with the deliberate exception of the checked-in, secret-free environment
-# inputs. These hold only environment name, region, CIDR and feature toggles.
-!environments/*/terraform.tfvars
+# ...with the deliberate exception of the example file. Environment inputs are
+# environments/<env>/config.yaml — YAML, not tfvars, and never ignored.
 !*.tfvars.example
 
 # Provider lock files ARE committed on purpose — they pin provider versions and

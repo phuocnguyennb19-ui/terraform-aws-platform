@@ -274,7 +274,7 @@ E · COMPLETE APPLICATION PLATFORM
            ▼
     RDS + ElastiCache
 
-all toggles true — see environments/prod/terraform.tfvars
+all toggles true — see environments/prod/config.yaml
 ```
 
 ---
@@ -297,9 +297,10 @@ all toggles true — see environments/prod/terraform.tfvars
         │                   │                   │
         └───────────────────┴───────────────────┘
                             │
-              IDENTICAL main.tf / variables.tf /
-              outputs.tf / providers.tf / backend.tf /
-              versions.tf  —  enforced by `make env-drift`
+              ONE root. All three run the same main.tf;
+              an environment is a config.yaml plus a
+              backend.hcl and nothing else, so they
+              cannot structurally diverge.
 
               Separate state bucket, key and lock per
               environment. No shared state, ever.
@@ -314,7 +315,7 @@ Gateway attachment impossible later, and the only fix is re-addressing a live en
 
 ```
        Terraform source ──┐
-       terraform.tfvars ──┤──▶  contains NO credential, by construction
+       config.yaml      ──┤──▶  contains NO credential, by construction
        Terraform state  ──┘      (there is no password variable to set)
 
                     ┌──────────────────────────────┐
