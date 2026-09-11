@@ -1,152 +1,156 @@
 # terraform-aws-platform
 
-The **values** for the AWS platform: one `config.yaml` and one `backend.hcl` per
-environment. There is no Terraform code here, no Makefile and no pipeline.
-
-The code — the root composition and every module — lives in
-[`terraform-module`](../terraform-module). A deploy clones it at a pinned tag, copies one
-environment's two files into the clone, and runs Terraform from the clone's root.
+The developer-facing AWS platform. You describe what your service needs in one
+`config.yaml`; the platform turns it into infrastructure.
 
 ```
-terraform-module          root (*.tf) + modules/ — the code, released by tag
-        ▲
-        │  git clone --branch <tag>; config.yaml + backend.hcl copied in
-        │
-terraform-aws-platform    this repo — values and state locations, per environment
+terraform/<env>/config.yaml        you edit this — services, database, cache, DNS
+        │  yamldecode → validate → defaults → normalize        terraform/config.tf, validation.tf
+        ▼
+terraform/main.tf                  composition: which modules, wired how
+        │  source = "git::…/terraform-module.git//modules/<name>?ref=v1.3.0"
+        ▼
+terraform-root-module              generic modules — typed inputs, no YAML
+        ▼
+AWS
 ```
 
-Current release: **`terraform-module` `v1.2.1`**.
+These two repositories are the whole system. Module versions are pinned by one `?ref=` on
+every `source` in `terraform/main.tf`; CI fails if they differ.
 
 ---
 
-## Layout
-
-```
-terraform-aws-platform/
-├── README.md
-└── environments/
-    ├── dev/
-    │   ├── config.yaml     every value that makes dev different
-    │   └── backend.hcl     which state this config writes
-    ├── staging/
-    └── prod/
-```
-
-An environment is these two files and nothing more. All three environments run the same
-root, so they cannot drift apart structurally: staging is a real rehearsal for prod because
-the only thing that differs is values.
-
----
-
-## Deploying
-
-Terraform must run from the clone's root — the root reads the config as
-`file("${path.cwd}/${var.config_file}")`, relative to the directory Terraform runs from.
-
-```bash
-ENV=dev          # dev | staging | prod
-TAG=v1.2.1       # the terraform-module release this environment runs
-
-git clone --quiet --depth 1 --branch "$TAG" \
-  https://github.com/phuocnguyennb19-ui/terraform-module.git tf
-cp "environments/$ENV/config.yaml" tf/config.yaml
-cp "environments/$ENV/backend.hcl" tf/backend.hcl
-
-cd tf
-terraform init -reconfigure -input=false -backend-config=backend.hcl
-terraform plan -input=false -var config_file=config.yaml -out=tfplan   # read it
-terraform apply -input=false tfplan                                     # applies what was read
-```
-
-- **Apply the saved plan, never a bare `terraform apply`.** A bare apply plans again, so what
-  gets applied is not what anyone read.
-- **The config and the backend always travel together.** Copying `dev/config.yaml` with
-  `prod/backend.hcl` plans dev values against prod state.
-- **Pin a tag, never a branch.** A new `terraform-module` release reaches an environment only
-  when its deploy is pointed at the new tag.
-- **First enable of ACM + ALB needs two passes.** The certificate must reach `ISSUED` before
-  the HTTPS listener can use it; re-run plan and apply once DNS validation completes.
-
-`terraform output` in the clone shows what was built — `enabled_modules`, `vpc_id`,
-`alb_dns_name`, `rds_endpoint`, `ecr_repository_urls` and the rest.
-
----
-
-## Writing a config
+## For developers: `config.yaml`
 
 ```yaml
-global:
-  project: platform
-  environment: dev          # prod switches on the hardening floor below
-  region: ap-southeast-1
+environment: dev                  # must match the folder name
+account_id: "111122223333"        # quoted: an unquoted ID loses leading zeros
+region: ap-southeast-1
 
-vpc:
-  enabled: true
-  cidr: "10.10.0.0/16"
+dns:                              # optional; required for more than one public service, and in prod
+  domain: dev.example.com
 
-rds:
+services:
+  payment:
+    image: payment:1.4.2          # <ecr-repo>:<tag>, or a full registry URI; never :latest
+    size: medium                  # small | medium | large
+    replicas: 2                   # default: 1 in dev, 2 in staging and prod
+    public: true                  # true → ALB + https://payment.<dns.domain>
+    health_check: /healthz        # default /healthz, on port 8080
+    autoscaling: { min: 2, max: 10 }
+    env:
+      LOG_LEVEL: info
+    secrets:                      # references only — never a value
+      API_KEY: arn:aws:secretsmanager:ap-southeast-1:111122223333:secret:payment-api-key
+
+database:
   enabled: true
-  instance_class: db.t4g.medium
+  size: small                     # small | medium | large
+
+cache:
+  enabled: false
+  size: small
+
+kubernetes:
+  enabled: false                  # optional EKS cluster for the platform team
 ```
 
-- **A module is built only when its block says `enabled: true`.** A block absent from the
-  file is not built; there is no `enabled: false` to write.
-- **Any key left out takes the module's default.** Write only what is a decision.
-- **The environment is `global.environment`, not a flag.** It names the environment in the
-  file that describes it, so a config cannot be applied as a different environment by
-  accident.
-- **An application stack** disables the shared modules and names what it uses under
-  `existing:` — by name and tag, never by raw ID.
+Only `environment`, `account_id` and `region` are required. Everything else has a default.
 
-Blocks the root understands: `kms`, `vpc`, `security_groups`, `iam`, `cloudwatch`, `ecr`,
-`route53`, `acm`, `alb`, `ecs_cluster`, `ecs_services`, `eks`, `ec2`, `rds`, `elasticache`,
-`lambda`, `existing`. Every key is read in `terraform-module`'s `locals.tf` and `main.tf` as
-`try(local.config.<block>.<key>, <default>)` — that is the reference.
+| You write | You get |
+|---|---|
+| `services.<name>` | An ECS Fargate service `platform-<env>-<name>`, logs, alarms, and an ECR repository named after the image |
+| `size` | `small` 0.25 vCPU / 512 MiB · `medium` 0.5 vCPU / 1 GiB · `large` 1 vCPU / 2 GiB |
+| `public: true` | A target group on the shared ALB; with `dns.domain`, `https://<name>.<domain>` and a wildcard certificate |
+| `database.enabled` | PostgreSQL 16 — `small` db.t4g.medium · `medium` db.t4g.large · `large` db.r6g.xlarge; every service gets `DATABASE_HOST`, `DATABASE_PORT`, `DATABASE_NAME` |
+| `cache.enabled` | Redis 7 — `small` cache.t4g.small · `medium` cache.t4g.medium · `large` cache.r7g.large; every service gets `REDIS_HOST`, `REDIS_PORT` |
+| `secrets` | Injected as environment variables at task start; the execution role is granted exactly those ARNs |
 
-### What the environments differ in
+Every service listens on **port 8080**. A mistake fails with a message that names the field:
+
+```
+terraform/dev/config.yaml is invalid:
+
+  - Invalid services.payment.size: "xlarge"
+    Supported values:
+    - small
+    - medium
+    - large
+```
+
+**Secrets.** An `env` name that looks like a credential (`PASSWORD`, `SECRET`, `TOKEN`,
+`PRIVATE_KEY`) is rejected — put it under `secrets` as a Secrets Manager or SSM ARN. The RDS
+master credentials live in Secrets Manager; `terraform output database_master_secret_arn`
+gives the ARN to reference.
+
+---
+
+## What the platform decides per environment
+
+Set in `terraform/config.tf` (`local.environments`), not in `config.yaml`:
 
 | | dev | staging | prod |
 |---|---|---|---|
-| CIDR | `10.10.0.0/16` | `10.20.0.0/16` | `10.30.0.0/16` |
-| AZs | 2 | 3 | 3, pinned explicitly |
-| NAT gateways | 1 (shared) | one per AZ | one per AZ (forced) |
-| RDS | single-AZ, `t4g.medium` | multi-AZ, `t4g.large` | multi-AZ, `r6g.xlarge` |
-| Backups | 3 days | 7 days | 30 days (floor) |
-| Deletion protection | off | off | on (forced) |
-| EKS API endpoint | public, CIDR-restricted | public, CIDR-restricted | private (forced) |
-| EKS capacity | spot only | on-demand + spot | on-demand floor + spot |
-| ElastiCache | — | 2 nodes | 3 nodes |
-| Log retention | 7 days | 30 days | 365 days (floor 90) |
-| TLS | none (HTTP) | ACM | ACM |
+| VPC CIDR / AZs | `10.10.0.0/16`, 2 | `10.20.0.0/16`, 3 | `10.30.0.0/16`, 3 pinned |
+| NAT gateways | 1 shared | one per AZ | one per AZ |
+| Log / flow-log retention | 7 days | 30 days | 365 days |
+| Default replicas | 1 | 2 | 2 (fewer is rejected) |
+| RDS | single-AZ, 3-day backups | multi-AZ, 7 days | multi-AZ, 30 days, deletion protection |
+| Redis nodes | 1 | 2 | 3 |
+| ECS Exec | on | on | off |
+| Public traffic | HTTP or HTTPS | HTTP or HTTPS | HTTPS only (`dns.domain` required) |
 
-### Production hardening floor
+---
 
-When `global.environment` is `prod`, the root forces these regardless of what the config
-says. Raising a value above the floor works; going below it is not expressible.
+## Running it locally
 
-| Forced in prod | Protects against |
-|---|---|
-| One NAT gateway per AZ | an AZ failure removing egress for the whole VPC |
-| RDS multi-AZ, deletion protection, final snapshot | an AZ failure or a mistargeted destroy reaching the data |
-| RDS backups ≥ 30 days | corruption discovered in week three being unrecoverable |
-| ALB deletion protection | the same, for the entry point |
-| EKS API endpoint private | the control plane being one credential leak from the internet |
-| Flow logs on, log retention ≥ 90 days | an investigation with nothing to read |
-| ElastiCache ≥ 2 nodes | a cache failure becoming a cold start under load |
-| EC2 termination protection, ECS ≥ 2 tasks | an accidental terminate; a deploy being an outage |
+```bash
+cd terraform
+terraform init -reconfigure -backend-config=dev/backend.hcl
+terraform plan -var environment=dev -out=tfplan
+terraform apply tfplan          # applies exactly what was planned
+```
+
+Switching environment means `init -reconfigure` against that environment's `backend.hcl` —
+the config and the state always travel together. The provider refuses to run when your
+credentials are not for `account_id` (`allowed_account_ids`).
+
+---
+
+## CI/CD
+
+`.gitlab-ci.yml` includes the templates in `ci/terraform.gitlab-ci.yml` (`.tf-validate`,
+`.tf-plan`, `.tf-apply`); each environment job only sets `TF_ENV`.
+
+```
+change terraform/<env>/config.yaml → MR
+  validate   fmt · one ?ref= · terraform validate · every config.yaml checked (no AWS needed)
+  plan:<env> only for environments whose files changed; saved plan as an artifact
+merge → default branch
+  apply:<env>  manual; applies that saved plan; staging waits for dev, prod for staging
+```
+
+| Variable | Where | Meaning |
+|---|---|---|
+| `ENVIRONMENT` | **Run pipeline** form | `dev` / `staging` / `prod` runs only that environment; empty runs every environment whose files changed |
+| `TF_ROOT`, `TF_VERSION` | `.gitlab-ci.yml` | Terraform directory and CLI version |
+| `AWS_PLAN_ROLE_ARN` | CI/CD variable, scoped to each environment | Read-only plan role; not protected — MR pipelines need it |
+| `AWS_APPLY_ROLE_ARN` | CI/CD variable, scoped to each environment, **protected** | Deploy role |
+
+Authentication is GitLab OIDC — no AWS keys are stored. Create protected environments
+`dev`, `staging`, `prod` with required approvals; the IAM OIDC provider's audience is the
+GitLab URL (`CI_SERVER_URL`). The plan artifact holds resolved values in plaintext: one-day
+expiry, developer access only.
 
 ---
 
 ## State
 
-`backend.hcl` names the bucket, key, region and lock for its environment; the root's
-`backend "s3" {}` is empty and takes them at `init`. One environment, one bucket, one key.
+`terraform/<env>/backend.hcl` names the bucket, key, region and lock table; the key contains
+the environment, so environments never share state. Terraform 1.5.7 locks through a DynamoDB
+table with partition key `LockID`.
 
-**Locking is not optional.** On Terraform 1.5.7 (`terraform-module`'s pinned CLI) it needs a
-DynamoDB table with partition key `LockID` (`dynamodb_table` in `backend.hcl`); on ≥ 1.10,
-replace that line with `use_lockfile = true`.
-
-The bucket and table must exist before the first `init`. Create them once, out of band:
+Create the bucket and table once per environment, before the first `init`:
 
 ```bash
 BUCKET=my-terraform-state-dev
@@ -154,55 +158,48 @@ REGION=ap-southeast-1
 
 aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
   --create-bucket-configuration LocationConstraint="$REGION"
-
-# Versioning: the only way back from a corrupted or truncated state.
 aws s3api put-bucket-versioning --bucket "$BUCKET" \
   --versioning-configuration Status=Enabled
-
-# Encryption: state holds every resolved value in plaintext.
 aws s3api put-bucket-encryption --bucket "$BUCKET" \
   --server-side-encryption-configuration \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms"},"BucketKeyEnabled":true}]}'
-
 aws s3api put-public-access-block --bucket "$BUCKET" \
   --public-access-block-configuration \
   BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-
 aws dynamodb create-table --table-name terraform-locks \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST --region "$REGION"
 ```
 
-**Treat state and saved plans as sensitive.** Both carry resolved values in plaintext; never
-publish a `tfplan` as a build artifact.
+State and saved plans carry resolved values in plaintext — treat both as sensitive.
 
 ---
 
-## Secrets
+## Changing the platform
 
-**No secret belongs in a config file**, and the root gives you nowhere to put one:
-
-| Secret | How it is handled |
-|---|---|
-| Database master password | Generated and rotated by AWS into Secrets Manager; the RDS module has no password input, so the value never passes through Terraform. |
-| Redis AUTH token | Referenced by Secrets Manager ARN (`elasticache.auth_token_secret_arn`). |
-| TLS private keys | Issued and renewed by ACM; never leave AWS. |
-| AWS credentials | An assumed role (`global.assume_role_arn`) or OIDC in CI — never a value here. |
-| Container secrets | By ARN under `secrets:`, fetched by the ECS execution role at task start. |
+- **A new developer option** → `config.tf` (normalize), `validation.tf` (reject bad values),
+  `main.tf` (wire it). Keep `config.yaml` backwards compatible: it is a public API.
+- **A capability no module has** → change the module in `terraform-root-module`, release a
+  tag, bump every `?ref=` in `main.tf` together.
+- **Never** read YAML inside a module, and never put a secret value in `config.yaml`.
 
 ---
 
 ## Known limitations
 
-1. **Not yet planned against a live AWS account.** All three environments plan cleanly
-   against a local AWS mock (moto) at `terraform-module` `v1.2.1` — dev 131, staging 166,
-   prod 176 resources. First-apply behaviour against real AWS is unverified.
-2. **Placeholders to replace before a real deploy:**
-   - `backend.hcl` — the `REPLACE-ME` bucket and lock table; `init` fails until they exist.
-   - staging / prod `route53.domain_name` — `staging.example.com` / `example.com` with
-     `create_zone: false`; the zone lookup fails until it names a real delegated zone.
-   - dev / staging `eks.public_api_cidrs` — `203.0.113.0/24` is a documentation range; set
-     it to your office or VPN egress range.
-3. **No automated checks live here.** There is no pipeline in this repository; whatever runs
-   the deploy is where plan review and approval gates belong.
+1. **`terraform-root-module` `v1.3.0` must be tagged and pushed** before `init` works: it adds
+   `ecs-service.enable_load_balancer`, without which a service cannot attach to a target group
+   created in the same apply.
+2. **Placeholders:** `account_id: "REPLACE-ME"` and `image: api:REPLACE-ME` in every
+   `config.yaml` (validate fails until `account_id` is real); the `REPLACE-ME` bucket and lock
+   table in every `backend.hcl`; `staging.example.com` / `example.com` must be real delegated
+   zones.
+3. **Services call each other through their API** — `https://<name>.<dns.domain>`, the same URL
+   clients use — so a service another service calls must be `public: true`. There is no
+   private service-to-service path (no Service Connect; tasks accept traffic only from the ALB),
+   and `public: false` means a worker with no inbound traffic. Calls from private tasks to the
+   public ALB leave through the NAT gateway, which is billed per GB; add a private path only
+   if that volume becomes significant.
+4. **Not yet applied to a real account.** dev / staging / prod plan cleanly against a local AWS
+   mock (moto): 104 / 134 / 148 resources.
