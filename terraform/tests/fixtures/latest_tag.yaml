@@ -1,0 +1,7 @@
+environment: dev
+account_id: "111122223333"
+region: ap-southeast-1
+
+services:
+  api:
+    image: api:latest

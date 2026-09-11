@@ -1,0 +1,65 @@
+include:
+  - local: ci/terraform.gitlab-ci.yml
+
+stages:
+  - validate
+  - plan
+  - apply
+
+variables:
+  TF_VERSION: "1.5.7"
+  TF_TEST_VERSION: "1.9.8"
+  TF_ROOT: terraform
+  TF_IN_AUTOMATION: "true"
+  ENVIRONMENT:
+    value: ""
+    options: ["", "dev", "staging", "prod"]
+    description: "Run pipeline: plan/apply only this environment. Empty: every environment whose files changed."
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+validate:
+  extends: .tf-validate
+
+contract-tests:
+  extends: .tf-contract-test
+
+plan:dev:
+  extends: .tf-plan
+  variables: { TF_ENV: dev }
+
+plan:staging:
+  extends: .tf-plan
+  variables: { TF_ENV: staging }
+
+plan:prod:
+  extends: .tf-plan
+  variables: { TF_ENV: prod }
+
+apply:dev:
+  extends: .tf-apply
+  variables: { TF_ENV: dev }
+  resource_group: terraform-dev
+  needs: ["plan:dev"]
+
+apply:staging:
+  extends: .tf-apply
+  variables: { TF_ENV: staging }
+  resource_group: terraform-staging
+  needs:
+    - job: "plan:staging"
+    - job: "apply:dev"
+      optional: true
+
+apply:prod:
+  extends: .tf-apply
+  variables: { TF_ENV: prod }
+  resource_group: terraform-prod
+  needs:
+    - job: "plan:prod"
+    - job: "apply:staging"
+      optional: true

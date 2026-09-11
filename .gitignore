@@ -1,17 +1,25 @@
-# Values only. Nothing Terraform produces belongs here — if a deploy is ever run
-# from inside this directory, its working state, plans and clones stay local.
+# Terraform working state and plans stay local. terraform/.terraform.lock.hcl is
+# committed on purpose: it pins provider versions and checksums for CI.
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
 tfplan
 tfplan-*
-/tf/
-/.tfmodule/
+plan-*.txt
+*_override.tf
+crash.log
+crash.*.log
+.terraformrc
+terraform.rc
 
-# Variable files may carry account-specific or sensitive values. Environment
-# inputs are environments/<env>/config.yaml — YAML, committed on purpose.
+# Credentials never belong in the repository; CI authenticates through OIDC.
+*.pem
+*.key
+.aws/
+credentials
+
+# Environment inputs are terraform/<env>/config.yaml — YAML, committed on purpose.
 *.tfvars
 *.tfvars.json
 

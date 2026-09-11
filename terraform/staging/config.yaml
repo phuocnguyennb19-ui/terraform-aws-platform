@@ -1,0 +1,21 @@
+environment: staging
+account_id: "REPLACE-ME"
+region: ap-southeast-1
+
+dns:
+  domain: staging.example.com
+
+services:
+  api:
+    image: api:REPLACE-ME
+    size: medium
+    public: true
+    health_check: /healthz
+
+database:
+  enabled: true
+  size: medium
+
+cache:
+  enabled: true
+  size: small

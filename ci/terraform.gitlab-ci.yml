@@ -1,0 +1,109 @@
+.tf-base:
+  image:
+    name: "hashicorp/terraform:${TF_VERSION}"
+    entrypoint: [""]
+  before_script:
+    - cd "$TF_ROOT"
+
+.tf-validate:
+  extends: .tf-base
+  stage: validate
+  script:
+    - terraform fmt -check -recursive
+    - |
+      refs="$(grep -ho '?ref=[^"]*' ./*.tf | sort -u)"
+      [ "$(echo "$refs" | wc -l)" -eq 1 ] || { echo "module sources pin different refs:"; echo "$refs"; exit 1; }
+    - printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf
+    - terraform init -input=false
+    - terraform validate
+    - |
+      fail=0
+      for dir in */; do
+        env="${dir%/}"
+        [ -f "${env}/config.yaml" ] || continue
+        if [ "$(echo 'length(local.config_errors) + length(local.policy_errors)' | terraform console -var "environment=${env}")" = "0" ]; then
+          echo "${TF_ROOT}/${env}/config.yaml: OK"
+        else
+          echo "${TF_ROOT}/${env}/config.yaml is invalid or not allowed in ${env}:"
+          echo 'concat(local.config_errors, local.policy_errors)' | terraform console -var "environment=${env}"
+          fail=1
+        fi
+      done
+      exit $fail
+
+.tf-contract-test:
+  extends: .tf-base
+  stage: validate
+  image:
+    name: "hashicorp/terraform:${TF_TEST_VERSION}"
+    entrypoint: [""]
+  script:
+    - terraform init -backend=false -input=false
+    - terraform test -no-color
+
+.tf-aws:
+  extends: .tf-base
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: $CI_SERVER_URL
+  before_script:
+    - cd "$TF_ROOT"
+    - '[ -n "$AWS_ROLE_ARN" ] || { echo "no role ARN for ${TF_ENV}: set AWS_PLAN_ROLE_ARN / AWS_APPLY_ROLE_ARN scoped to environment ${TF_ENV}"; exit 1; }'
+    - printf '%s' "$AWS_OIDC_TOKEN" > /tmp/web-identity-token
+    - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web-identity-token
+    - export AWS_ROLE_SESSION_NAME="gitlab-${CI_PROJECT_ID}-${CI_JOB_ID}"
+    - export AWS_REGION="$(sed -n 's/^region:[[:space:]]*//p' "${TF_ENV}/config.yaml" | head -1)"
+
+.tf-plan:
+  extends: .tf-aws
+  stage: plan
+  variables:
+    AWS_ROLE_ARN: $AWS_PLAN_ROLE_ARN
+  environment:
+    name: $TF_ENV
+    action: prepare
+  script:
+    - terraform init -input=false -reconfigure -backend-config="${TF_ENV}/backend.hcl"
+    - terraform plan -input=false -lock-timeout=5m -compact-warnings -var "environment=${TF_ENV}" -out="tfplan-${TF_ENV}" > /dev/null
+    # The log carries addresses and actions only, never attribute values; the full plan stays in the artifact.
+    - terraform show -no-color "tfplan-${TF_ENV}" | grep -E '^  # |^Plan:|^No changes' || true
+  artifacts:
+    paths:
+      - "${TF_ROOT}/tfplan-${TF_ENV}"
+    expire_in: 1 day
+    access: developer
+  rules:
+    - if: $ENVIRONMENT && $ENVIRONMENT != $TF_ENV
+      when: never
+    - if: $ENVIRONMENT == $TF_ENV
+    - changes:
+        - .gitlab-ci.yml
+        - ci/**/*
+        - $TF_ROOT/*.tf
+        - $TF_ROOT/.terraform.lock.hcl
+        - $TF_ROOT/$TF_ENV/**/*
+
+.tf-apply:
+  extends: .tf-aws
+  stage: apply
+  variables:
+    AWS_ROLE_ARN: $AWS_APPLY_ROLE_ARN
+  environment:
+    name: $TF_ENV
+  script:
+    - terraform init -input=false -reconfigure -backend-config="${TF_ENV}/backend.hcl"
+    - terraform apply -input=false -lock-timeout=5m "tfplan-${TF_ENV}"
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+      when: never
+    - if: $ENVIRONMENT && $ENVIRONMENT != $TF_ENV
+      when: never
+    - if: $ENVIRONMENT == $TF_ENV
+      when: manual
+    - changes:
+        - .gitlab-ci.yml
+        - ci/**/*
+        - $TF_ROOT/*.tf
+        - $TF_ROOT/.terraform.lock.hcl
+        - $TF_ROOT/$TF_ENV/**/*
+      when: manual

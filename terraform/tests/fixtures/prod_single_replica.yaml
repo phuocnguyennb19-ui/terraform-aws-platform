@@ -1,0 +1,12 @@
+environment: prod
+account_id: "444455556666"
+region: ap-southeast-1
+
+dns:
+  domain: example.com
+
+services:
+  api:
+    image: api:1.4.2
+    replicas: 1
+    public: true
