@@ -1,0 +1,24 @@
+environment: dev
+account_id: "REPLACE-ME"
+region: ap-southeast-1
+
+chart:
+  repository: oci://REPLACE-ME.dkr.ecr.ap-southeast-1.amazonaws.com/charts
+  name: application
+  version: "2.0.0"
+
+cluster:
+  access:
+    gitlab-plan:
+      principal_arn: "arn:aws:iam::REPLACE-ME:role/REPLACE-ME"
+      policy: admin-view
+
+services:
+  api:
+    image: api:REPLACE-ME
+    size: small
+    health_check: /healthz
+
+database:
+  enabled: true
+  size: small

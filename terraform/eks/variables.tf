@@ -1,5 +1,5 @@
 variable "environment" {
-  description = "Which terraform/<environment>/config.yaml to deploy."
+  description = "Which terraform/eks/<environment>/config.yaml to deploy."
   type        = string
 
   validation {
@@ -9,7 +9,7 @@ variable "environment" {
 }
 
 variable "config_path" {
-  description = "Contract tests only: read this file (under tests/fixtures/, relative to terraform/) instead of <environment>/config.yaml. Deployments never set it, and the file must still declare the environment being planned."
+  description = "Contract tests only: read this file (under tests/fixtures/, relative to terraform/eks/) instead of <environment>/config.yaml. Deployments never set it, and the file must still declare the environment being planned."
   type        = string
   default     = null
 

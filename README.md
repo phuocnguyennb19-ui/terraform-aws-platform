@@ -6,7 +6,7 @@ from the reusable modules of [terraform-module](https://github.com/phuocnguyennb
 
 ```
                      Developer
-                         │  terraform/<env>/config.yaml
+                         │  terraform/{ecs,eks}/<env>/config.yaml
                          ▼
   ┌──────────────────────────────────────────────────┐
   │ platform-engine (this repo)                      │
@@ -29,9 +29,19 @@ from the reusable modules of [terraform-module](https://github.com/phuocnguyennb
 environments or policy, and are tested and released on their own. Everything a developer or an
 environment decides lives here. There is no third repository.
 
+**Two stacks.** `terraform/ecs/` runs services on ECS Fargate; `terraform/eks/` runs them on EKS
+as Helm releases. They are independent Terraform roots — each builds its own VPC, KMS keys,
+database and cache, and keeps its own state — so a service lives in exactly one of them.
+
+```
+terraform/
+├── ecs/  *.tf · tests/ · dev|staging|prod/{config.yaml,backend.hcl}   state key platform/<env>/…
+└── eks/  *.tf · tests/ · dev|staging|prod/{config.yaml,backend.hcl}   state key eks/<env>/…
+```
+
 ---
 
-## For developers: `config.yaml`
+## For developers: `config.yaml` on ECS — `terraform/ecs/<env>/config.yaml`
 
 ```yaml
 environment: dev                  # must match the folder name
@@ -83,7 +93,7 @@ Only `environment`, `account_id` and `region` are required.
 A mistake fails before anything touches AWS, naming the field:
 
 ```
-terraform/dev/config.yaml is invalid:
+terraform/ecs/dev/config.yaml is invalid:
 
   - Invalid services.payment.size: "xlarge"
     Supported values:
@@ -103,10 +113,64 @@ the environment policy below.
 
 ---
 
+## For developers: `config.yaml` on EKS — `terraform/eks/<env>/config.yaml`
+
+```yaml
+environment: dev
+account_id: "111122223333"
+region: ap-southeast-1
+
+chart:                            # required; one chart for every service, promoted env by env
+  repository: oci://111122223333.dkr.ecr.ap-southeast-1.amazonaws.com/charts
+  name: application
+  version: "2.0.0"                # exact version, never a range
+
+cluster:
+  access:                         # EKS access entries; the CI plan role needs admin-view
+    gitlab-plan:
+      principal_arn: "arn:aws:iam::111122223333:role/gitlab-plan"
+      policy: admin-view          # view | admin-view | edit | admin; prod: view | admin-view
+
+services:
+  payment:
+    image: payment:1.4.2          # short name → <account>.dkr.ecr.<region>.amazonaws.com/eks/payment
+    size: medium
+    replicas: 2
+    health_check: /healthz
+    autoscaling: { min: 2, max: 10 }
+    env:
+      LOG_LEVEL: info
+
+database: { enabled: true, size: small }
+cache:    { enabled: false }
+```
+
+| You write | You get |
+|---|---|
+| `services.<name>` | Helm release `<name>` of `chart` in namespace `platform`: Deployment, Service `http://<name>:8080`, an ECR repository `eks/<image>` |
+| `size` | requests `small` 250m / 512Mi · `medium` 500m / 1Gi · `large` 1 / 2Gi; memory limit = request, no CPU limit |
+| `health_check` | readiness probe on that path; liveness is a TCP check, so a failing dependency never restarts pods |
+| `autoscaling` | HorizontalPodAutoscaler; a PodDisruptionBudget wherever at least 2 pods run |
+| `database.enabled` / `cache.enabled` | as on ECS; releases get `DATABASE_HOST/PORT/NAME`, `REDIS_HOST/PORT` |
+
+Not on EKS yet: `public` (needs the AWS Load Balancer Controller) and `secrets` (needs External
+Secrets or the Secrets Store CSI driver) — both are rejected as unknown keys, not ignored.
+Releases are `atomic`: a failed upgrade rolls back to the previous revision.
+
+**Before the first apply:** publish the chart to `chart.repository` (`helm push
+application-2.0.0.tgz oci://…/charts`); give the plan role an access entry through
+`cluster.access` (the apply role creates the cluster and holds cluster admin); and make sure the
+CI runners reach the EKS API — dev and staging allow `eks_public_api_cidrs`, prod's endpoint is
+private, so prod plan and apply need a runner inside the VPC.
+
+---
+
 ## Environment policy
 
-Set in `terraform/config.tf` (`local.environments`) and `terraform/policy.tf` — never in
-`config.yaml`, so no config can opt out of it.
+Set in `terraform/<stack>/config.tf` (`local.environments`) and `terraform/<stack>/policy.tf` —
+never in `config.yaml`, so no config can opt out of it. The table is ECS; EKS uses VPCs
+`10.11/10.21/10.31.0.0/16`, the same retention and database policy, the node groups in
+`terraform/eks/config.tf`, and in prod a private API endpoint and view-only access from config.
 
 | | dev (cost) | staging (production-like) | prod (availability) |
 |---|---|---|---|
@@ -133,7 +197,7 @@ reach each other on 8080 by security-group reference. Tasks have no public IP; e
 ## Running it locally
 
 ```bash
-cd terraform
+cd terraform/ecs                # or terraform/eks
 terraform init -reconfigure -backend-config=dev/backend.hcl
 terraform plan -var environment=dev -out=tfplan
 terraform apply tfplan          # applies exactly what was planned
@@ -155,15 +219,19 @@ rm backend_override.tf
 
 ## Tests
 
-`terraform/tests/platform.tftest.hcl` pins the developer contract: fixtures in
-`terraform/tests/fixtures/` must map to exact module inputs (size → CPU/memory, image → ECR URI,
+`terraform/ecs/tests/platform.tftest.hcl` pins the developer contract: fixtures in
+`terraform/ecs/tests/fixtures/` must map to exact module inputs (size → CPU/memory, image → ECR URI,
 secret ARN → execution-role grant, prod defaults), and invalid or disallowed configs must fail
 — unknown keys, bad sizes and replica counts, `:latest`, a secret value in `env`, an unquoted
 ARN, a missing account, a prod config with one replica or public HTTP. The runs target
 `terraform_data.config`, so no AWS resource is planned and no credentials are needed.
 
+`terraform/eks/tests/eks.tftest.hcl` does the same for Helm values (size → requests, image →
+repository and tag, probes, HPA and PDB, access entries) and rejects a chart version range, a
+missing chart, cluster admin from config and edit access in prod.
+
 ```bash
-cd terraform && terraform init -backend=false && terraform test   # Terraform >= 1.7
+cd terraform/ecs && terraform init -backend=false && terraform test   # Terraform >= 1.7; same in terraform/eks
 ```
 
 ---
@@ -171,22 +239,30 @@ cd terraform && terraform init -backend=false && terraform test   # Terraform >=
 ## CI/CD
 
 `.gitlab-ci.yml` includes the templates in `ci/terraform.gitlab-ci.yml` (`.tf-validate`,
-`.tf-contract-test`, `.tf-plan`, `.tf-apply`); each environment job only sets `TF_ENV`.
+`.tf-contract-test`, `.tf-plan`, `.tf-apply`). There is one `plan` and one `apply` job; the branch
+is the environment. `workflow:rules` runs a pipeline only for the `dev`, `staging` and `prod`
+branches and merge requests targeting them, and each job's `rules` set `TF_ENV` from that branch.
+Every job runs once per stack through `parallel:matrix` (`STACK: [ecs, eks]`), in
+`terraform/<stack>/`.
 
 ```
-merge request
+merge request → dev | staging | prod           TF_ENV = target branch
   validate         fmt · one ?ref= for every module · terraform validate · every config.yaml (layers 1+2)
   contract-tests   terraform test (Terraform 1.9.8, mocked provider)
-  plan:<env>       only for environments whose files changed; the log lists addresses and actions only
-merge → default branch
-  plan:<env>       again, from the merge commit
-  apply:<env>      manual; applies that pipeline's saved plan — never re-plans
-                   staging waits for dev, prod for staging; one apply per environment at a time
+  plan             the log lists addresses and actions only
+push / Run pipeline on dev | staging | prod    TF_ENV = branch
+  validate, contract-tests, plan               again, from the pushed commit
+  apply            manual; applies that pipeline's saved plan — never re-plans
+                   one apply per stack and environment at a time
 ```
+
+Promotion is a merge between environment branches (`dev` → `staging` → `prod`). Other branches,
+including the default branch, run no pipeline.
 
 | Variable | Where | Meaning |
 |---|---|---|
-| `ENVIRONMENT` | **Run pipeline** form | `dev` / `staging` / `prod` runs only that environment; empty: every environment whose files changed |
+| `TF_ENV` | `rules` of `plan` / `apply` | `dev` / `staging` / `prod`, taken from the branch |
+| `STACK` | `.stacks` matrix | `ecs` / `eks` — the Terraform root under `TF_ROOT` |
 | `TF_VERSION`, `TF_TEST_VERSION`, `TF_ROOT` | `.gitlab-ci.yml` | deploy CLI 1.5.7, test CLI 1.9.8, Terraform directory |
 | `AWS_PLAN_ROLE_ARN` | CI/CD variable, scoped to each environment | read-only plan role — not protected, MR pipelines need it |
 | `AWS_APPLY_ROLE_ARN` | CI/CD variable, scoped to each environment, **protected** | deploy role — only protected branches see it |
@@ -196,8 +272,9 @@ them from the console). It is kept one day, visible to developers and above only
 printed: the job log shows resource addresses and actions, not attribute values.
 
 **Safety.** Apply runs the saved plan of the same pipeline; if state moved since, Terraform
-refuses the stale plan. `resource_group` serialises applies per environment and the DynamoDB lock
-guards the state. prod apply needs a protected `prod` environment with required approvers.
+refuses the stale plan. `resource_group` serialises applies per stack and environment and the DynamoDB lock
+guards the state. The `dev`, `staging` and `prod` branches must be protected (the apply role
+variable is protected), and prod apply needs a protected `prod` environment with required approvers.
 
 ### AWS authentication — OIDC, no stored keys
 
@@ -216,7 +293,7 @@ per account:
   }
 }
 
-// apply role — the default branch only; deploy permissions, never AdministratorAccess
+// apply role — only that account's environment branch (dev | staging | prod); deploy permissions, never AdministratorAccess
 {
   "Effect": "Allow",
   "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/<gitlab-host>" },
@@ -224,7 +301,7 @@ per account:
   "Condition": {
     "StringEquals": {
       "<gitlab-host>:aud": "https://<gitlab-host>",
-      "<gitlab-host>:sub": "project_path:<group>/platform-engine:ref_type:branch:ref:main"
+      "<gitlab-host>:sub": "project_path:<group>/platform-engine:ref_type:branch:ref:<env>"
     }
   }
 }
@@ -237,8 +314,9 @@ RDS monitoring) cannot exceed it.
 
 ## State
 
-`terraform/<env>/backend.hcl` names the bucket, key, region and lock table; the key contains the
-environment and CI checks it, so environments never share state. Terraform 1.5.7 locks through a
+`terraform/<stack>/<env>/backend.hcl` names the bucket, key, region and lock table; the key contains the
+environment and CI checks it, so environments never share state. The stacks share the bucket and
+lock table of an account under different keys (`platform/<env>/` for ECS, `eks/<env>/` for EKS). Terraform 1.5.7 locks through a
 DynamoDB table (`use_lockfile` needs ≥ 1.10). Create the bucket and table once per account:
 
 ```bash
@@ -268,8 +346,8 @@ table, the apply role also `s3:PutObject`. State and saved plans are sensitive.
 
 ## Versioning
 
-Every module `source` in `terraform/main.tf` pins the same terraform-module tag; CI fails if two
-differ, so an environment always runs one tested module set.
+Every module `source` in `terraform/<stack>/main.tf` pins the same terraform-module tag; CI fails if two
+differ, so an environment always runs one tested module set. Both stacks pin the same tag.
 
 | platform-engine | terraform-module | Notes |
 |---|---|---|
@@ -287,8 +365,13 @@ for every environment.
 1. **terraform-module `v2.0.0` must be tagged and pushed** before `init` works.
 2. **Placeholders:** `account_id: "REPLACE-ME"` and `image: api:REPLACE-ME` in every
    `config.yaml` (validate fails until `account_id` is real); the `REPLACE-ME` bucket and lock table
-   in every `backend.hcl`; `staging.example.com` / `example.com` must be real delegated zones.
+   in every `backend.hcl`; `staging.example.com` / `example.com` must be real delegated zones. On
+   EKS also `chart.repository` and the `cluster.access` role ARN, and `eks_public_api_cidrs`
+   (`203.0.113.0/24`, a documentation range) in `terraform/eks/config.tf` must become the runners' range.
 3. **One container port (8080) for every service** — the security groups open one application
    port from the ALB and between tasks.
-4. **Not yet applied to a real account.** dev / staging / prod plan cleanly against a local AWS
-   mock (moto): 107 / 137 / 151 resources.
+4. **Not yet applied to a real account.** ECS dev / staging / prod plan cleanly against a local AWS
+   mock (moto): 107 / 137 / 151 resources. The EKS stack has passed validate, its contract tests
+   and a `helm template` of the chart with its values, but no plan: Helm needs a real cluster.
+5. **EKS: Helm releases share state with the cluster that serves them.** The helm provider is
+   configured from `module.eks`, so replacing the cluster needs a plan that removes the releases first.

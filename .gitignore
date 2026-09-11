@@ -1,4 +1,4 @@
-# Terraform working state and plans stay local. terraform/.terraform.lock.hcl is
+# Terraform working state and plans stay local. terraform/<stack>/.terraform.lock.hcl is
 # committed on purpose: it pins provider versions and checksums for CI.
 .terraform/
 *.tfstate
@@ -19,7 +19,7 @@ terraform.rc
 .aws/
 credentials
 
-# Environment inputs are terraform/<env>/config.yaml — YAML, committed on purpose.
+# Environment inputs are terraform/<stack>/<env>/config.yaml — YAML, committed on purpose.
 *.tfvars
 *.tfvars.json
 

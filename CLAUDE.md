@@ -18,8 +18,12 @@ is a change here. The policy for the pair is in `../CLAUDE.md`.
 
 ## Commands
 
+`terraform/ecs/` (ECS Fargate services) and `terraform/eks/` (EKS + one Helm release per service)
+are independent roots with their own state and `<env>/{config.yaml,backend.hcl}`. Run everything
+below inside one of them.
+
 ```bash
-cd terraform
+cd terraform/ecs                                 # or terraform/eks
 terraform fmt -check -recursive
 terraform init -backend=false && terraform validate
 terraform test                                   # contract tests, Terraform >= 1.7
@@ -40,24 +44,28 @@ rm backend_override.tf
 
 A full plan without an AWS account runs against moto with a `providers_override.tf` pointing every
 endpoint at it — only in a scratch copy, never in the repo. To try an unreleased module, point
-its `source` at `../../terraform-root-module/modules/<name>` in that copy.
+its `source` at `../../../terraform-root-module/modules/<name>` in that copy.
 
 ## How a config becomes infrastructure
 
 - `config.tf` — `yamldecode` inside `try()` (a syntax error becomes a readable config error),
   `local.environments` (per-environment defaults), `local.sizes`, `local.services` (normalized)
-  and `local.service_specs` (exact ECS inputs). `service_specs` must never reference a module
-  output — the contract tests evaluate it without planning AWS.
+  and `local.service_specs` (exact ECS inputs; on EKS `local.release_specs`, the Helm values).
+  Neither may reference a module output — the contract tests evaluate them without planning AWS.
 - `validation.tf` — **layer 1**, `local.config_errors`: is the config well-formed?
 - `policy.tf` — **layer 2**, `local.policy_errors`: is a well-formed config allowed in this
   environment? Both are enforced by `terraform_data.config` preconditions; layer 3 (can AWS build
   it) is the modules' own validation.
 - `main.tf` — composition. Every `source` pins the same `?ref=`; CI fails if they differ.
-- `ci/terraform.gitlab-ci.yml` — templates; `.gitlab-ci.yml` sets `TF_ENV` per job.
-  `ENVIRONMENT` (Run pipeline) limits a run to one environment.
+- `ci/terraform.gitlab-ci.yml` — templates; `.gitlab-ci.yml` has one `plan` and one `apply` job
+  whose `rules` set `TF_ENV` from the branch, each run per stack by `parallel:matrix` `STACK`.
+  `workflow:rules` allows only the `dev`, `staging` and `prod` branches and merge requests
+  targeting them.
 
 A new developer key needs: normalization in `config.tf`, the key in the unknown-key lists and a
-check in `validation.tf`, wiring in `main.tf`, and a fixture + run in `tests/platform.tftest.hcl`.
+check in `validation.tf`, wiring in `main.tf`, and a fixture + run in the stack's `tests/*.tftest.hcl`.
+The two stacks name every resource apart (`platform-<env>-*` vs `platform-eks-<env>-*`, ECR `eks/*`)
+so they can share an account — keep it that way.
 
 ## Traps
 

@@ -11,55 +11,54 @@ variables:
   TF_TEST_VERSION: "1.9.8"
   TF_ROOT: terraform
   TF_IN_AUTOMATION: "true"
-  ENVIRONMENT:
-    value: ""
-    options: ["", "dev", "staging", "prod"]
-    description: "Run pipeline: plan/apply only this environment. Empty: every environment whose files changed."
 
+# The branch is the environment: dev, staging and prod each have one. A push (or Run pipeline)
+# on that branch runs its environment; a merge request runs the environment of its target branch.
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_PIPELINE_SOURCE == "web"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(dev|staging|prod)$/
+    - if: $CI_COMMIT_BRANCH =~ /^(dev|staging|prod)$/
+
+# terraform/ecs and terraform/eks are independent stacks with their own state. Each job runs once
+# per stack; STACK selects terraform/<stack>/, TF_ENV selects terraform/<stack>/<env>/.
+.stacks:
+  parallel:
+    matrix:
+      - STACK: [ecs, eks]
 
 validate:
-  extends: .tf-validate
+  extends: [.tf-validate, .stacks]
+  tags: [tf-validate-runner]
 
 contract-tests:
-  extends: .tf-contract-test
+  extends: [.tf-contract-test, .stacks]
+  tags: [tf-contract-tests-runner]
 
-plan:dev:
-  extends: .tf-plan
-  variables: { TF_ENV: dev }
+plan:
+  extends: [.tf-plan, .stacks]
+  tags: [tf-plan-runner]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev"
+      variables: { TF_ENV: dev }
+    - if: $CI_COMMIT_BRANCH == "staging" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "staging"
+      variables: { TF_ENV: staging }
+    - if: $CI_COMMIT_BRANCH == "prod" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "prod"
+      variables: { TF_ENV: prod }
 
-plan:staging:
-  extends: .tf-plan
-  variables: { TF_ENV: staging }
-
-plan:prod:
-  extends: .tf-plan
-  variables: { TF_ENV: prod }
-
-apply:dev:
-  extends: .tf-apply
-  variables: { TF_ENV: dev }
-  resource_group: terraform-dev
-  needs: ["plan:dev"]
-
-apply:staging:
-  extends: .tf-apply
-  variables: { TF_ENV: staging }
-  resource_group: terraform-staging
-  needs:
-    - job: "plan:staging"
-    - job: "apply:dev"
-      optional: true
-
-apply:prod:
-  extends: .tf-apply
-  variables: { TF_ENV: prod }
-  resource_group: terraform-prod
-  needs:
-    - job: "plan:prod"
-    - job: "apply:staging"
-      optional: true
+# Merge request pipelines never apply: CI_COMMIT_BRANCH is unset in them.
+# needs: plan waits for both stacks' plans; each apply finds its own at terraform/<stack>/tfplan-<env>.
+apply:
+  extends: [.tf-apply, .stacks]
+  tags: [tf-apply-runner]
+  resource_group: terraform-$STACK-$TF_ENV
+  needs: ["plan"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables: { TF_ENV: dev }
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "staging"
+      variables: { TF_ENV: staging }
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "prod"
+      variables: { TF_ENV: prod }
+      when: manual
