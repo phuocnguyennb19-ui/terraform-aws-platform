@@ -1,5 +1,5 @@
 variable "environment" {
-  description = "Which terraform/ecs/<environment>/config.yaml to deploy."
+  description = "Which terraform/env/<environment>/config.yaml to deploy."
   type        = string
 
   validation {
@@ -9,18 +9,23 @@ variable "environment" {
 }
 
 variable "config_path" {
-  description = "Contract tests only: read this file (under tests/fixtures/, relative to terraform/ecs/) instead of <environment>/config.yaml. Deployments never set it, and the file must still declare the environment being planned."
+  description = "Contract tests only: a fixture under modules/config/tests/fixtures/. Deployments never set it."
   type        = string
   default     = null
-
-  validation {
-    condition     = var.config_path == null || can(regex("^tests/fixtures/[A-Za-z0-9_.-]+\\.ya?ml$", coalesce(var.config_path, "-")))
-    error_message = "config_path is a test hook: it may only name a file under tests/fixtures/."
-  }
 }
 
 variable "tags" {
   description = "Extra tags CI knows and the config does not — the commit SHA, the pipeline ID."
   type        = map(string)
   default     = {}
+}
+
+variable "base_state_bucket" {
+  description = "Bucket holding the base stack's state — the same bucket as this stack's, from terraform/env/<env>/backend.hcl. CI passes it; a runtime stack cannot plan without reading what base built."
+  type        = string
+}
+
+variable "base_state_region" {
+  description = "Region of that bucket."
+  type        = string
 }

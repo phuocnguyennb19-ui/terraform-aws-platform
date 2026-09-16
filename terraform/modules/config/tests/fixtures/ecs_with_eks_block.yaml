@@ -1,0 +1,12 @@
+environment: dev
+account_id: "111122223333"
+region: ap-southeast-1
+
+platform:
+  type: ecs
+
+eks:
+  access:
+    developers:
+      principal_arn: "arn:aws:iam::111122223333:role/developers"
+      policy: view

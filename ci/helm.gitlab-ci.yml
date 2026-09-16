@@ -1,0 +1,112 @@
+.helm-base:
+  image:
+    name: "${HELM_IMAGE}"
+    entrypoint: [""]
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: $CI_SERVER_URL
+
+# Authenticates to AWS, then to the chart's registry when it is ECR, and pulls the pinned chart
+# into $CHART_DIR. Both jobs below read terraform/helm-values/<env>.json or deploy-<env>.json,
+# which carry the same { chart, region } the config pinned.
+.helm-chart-pull: &helm-chart-pull |
+  [ -n "$AWS_ROLE_ARN" ] || { echo "no role ARN for ${TF_ENV}: set the CI/CD variable scoped to environment ${TF_ENV}"; exit 1; }
+  printf '%s' "$AWS_OIDC_TOKEN" > /tmp/web-identity-token
+  export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web-identity-token
+  export AWS_ROLE_SESSION_NAME="gitlab-${CI_PROJECT_ID}-${CI_JOB_ID}"
+  export AWS_REGION="$(jq -r .region "$SOURCE")"
+  chart_ref="$(jq -r .chart.ref "$SOURCE")"
+  chart_version="$(jq -r .chart.version "$SOURCE")"
+  registry_host="$(jq -r .chart.registry_host "$SOURCE")"
+  if [ "$(jq -r '.chart.ecr_registry_id // ""' "$SOURCE")" != "" ]; then
+    aws ecr get-login-password --region "$AWS_REGION" \
+      | helm registry login --username AWS --password-stdin "$registry_host"
+  fi
+  CHART_DIR=/tmp/chart
+  rm -rf "$CHART_DIR" && mkdir -p "$CHART_DIR"
+  helm pull "$chart_ref" --version "$chart_version" --untar --untardir "$CHART_DIR"
+  CHART="${CHART_DIR}/$(ls "$CHART_DIR")"
+  echo "chart: ${chart_ref}:${chart_version}"
+
+# Renders the pinned chart with the values this environment's config produces, and checks the
+# manifests against the cluster's Kubernetes schemas. Reads only; never touches a cluster.
+.helm-validate:
+  extends: .helm-base
+  stage: validate
+  variables:
+    AWS_ROLE_ARN: $AWS_PLAN_ROLE_ARN
+  environment:
+    name: $TF_ENV
+    action: prepare
+  script:
+    - |
+      set -eu
+      SOURCE="${TF_ROOT}/helm-values/${TF_ENV}.json"
+      if [ ! -f "$SOURCE" ]; then
+        echo "${TF_ENV} runs platform ecs: no chart and no Helm values to check."
+        exit 0
+      fi
+    - *helm-chart-pull
+    - |
+      set -eu
+      k8s="$(cat "${TF_ROOT}/helm-values/kubernetes-version").0"
+      helm show values "$CHART" | yq -o=json > /tmp/chart-values.json
+      for svc in $(jq -r '.releases | keys[]' "$SOURCE"); do
+        echo "--- ${TF_ENV}: ${svc}"
+        jq ".releases.\"${svc}\"" "$SOURCE" > /tmp/values.json
+        # The chart's values.schema.json allows unknown keys, so a key it no longer honours would
+        # deploy silently with the chart's own default. This is what catches that.
+        unknown="$(jq -c --slurpfile c /tmp/chart-values.json -f ci/unknown-values-keys.jq /tmp/values.json)"
+        [ "$unknown" = "[]" ] || { echo "config.tf emits value keys ${chart_ref}:${chart_version} does not define: ${unknown}"; exit 1; }
+        helm lint --strict "$CHART" -f /tmp/values.json
+        # An ExternalSecret is a CRD: without a schema for it, -strict fails the whole render.
+        helm template "$svc" "$CHART" -f /tmp/values.json \
+          | kubeconform -strict -summary -kubernetes-version "$k8s" \
+              -schema-location default -schema-location "$CRD_SCHEMAS"
+      done
+
+# Installs or upgrades one release of the pinned chart per service, with the values the apply job
+# took from Terraform. Server-side dry-run of every release first, then atomic upgrades: a release
+# that does not become ready within HELM_TIMEOUT rolls back to its previous revision.
+.helm-deploy:
+  extends: .helm-base
+  stage: deploy
+  variables:
+    AWS_ROLE_ARN: $AWS_APPLY_ROLE_ARN
+  environment:
+    name: $TF_ENV
+  script:
+    - |
+      set -eu
+      SOURCE="${TF_ROOT}/eks/deploy-${TF_ENV}.json"
+      platform="$(jq -r .platform "$SOURCE")"
+      if [ "$platform" != "eks" ]; then
+        echo "platform ${platform}: terraform apply deployed the services; nothing to install with Helm."
+        exit 0
+      fi
+    - *helm-chart-pull
+    - |
+      set -eu
+      export KUBECONFIG=/tmp/kubeconfig
+      cluster="$(jq -r .cluster_name "$SOURCE")"
+      ns="$(jq -r .namespace "$SOURCE")"
+      aws eks update-kubeconfig --name "$cluster" --region "$AWS_REGION" > /dev/null
+
+      kubectl get namespace "$ns" > /dev/null 2>&1 || kubectl create namespace "$ns"
+      kubectl label namespace "$ns" --overwrite pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/enforce-version=latest
+
+      jq -r '.releases | keys[]' "$SOURCE" > /tmp/releases
+      for svc in $(cat /tmp/releases); do
+        jq ".releases.\"${svc}\"" "$SOURCE" > "/tmp/values-${svc}.json"
+        helm upgrade --install "$svc" "$CHART" --namespace "$ns" --values "/tmp/values-${svc}.json" --dry-run=server > /dev/null
+      done
+      for svc in $(cat /tmp/releases); do
+        helm upgrade --install "$svc" "$CHART" --namespace "$ns" --values "/tmp/values-${svc}.json" \
+          --atomic --wait --timeout "$HELM_TIMEOUT" --history-max 10
+      done
+      helm list --namespace "$ns" --all
+
+      # Removing a release is destructive, so it is never automatic: the job names it and stops there.
+      for rel in $(helm list --namespace "$ns" --all -q); do
+        grep -qx "$rel" /tmp/releases || echo "WARNING: release ${rel} is not in ${TF_ENV}/config.yaml. Remove it deliberately: helm uninstall ${rel} --namespace ${ns}"
+      done

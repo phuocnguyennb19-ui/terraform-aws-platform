@@ -2,34 +2,65 @@
   image:
     name: "hashicorp/terraform:${TF_VERSION}"
     entrypoint: [""]
-  before_script:
-    - cd "${TF_ROOT}/${STACK}"
 
+# Everything that needs no cloud: formatting, one module ref, each stack's own validity, and every
+# environment's config — read through modules/config, which pulls in no provider and no AWS module.
 .tf-validate:
   extends: .tf-base
   stage: validate
   script:
+    - cd "${TF_ROOT}"
     - terraform fmt -check -recursive
     - |
-      refs="$(grep -ho '?ref=[^"]*' ./*.tf | sort -u)"
+      refs="$(grep -ho '?ref=[^"]*' */*.tf | sort -u)"
       [ "$(echo "$refs" | wc -l)" -eq 1 ] || { echo "module sources pin different refs:"; echo "$refs"; exit 1; }
-    - printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf
-    - terraform init -input=false
-    - terraform validate
+    - |
+      for stack in $STACKS; do
+        echo "--- terraform validate: ${stack}"
+        ( cd "$stack" && terraform init -backend=false -input=false > /dev/null && terraform validate )
+      done
+    # One state key per stack per environment, so backend.hcl must not pin one of its own.
     - |
       fail=0
-      for dir in */; do
-        env="${dir%/}"
-        [ -f "${env}/config.yaml" ] || continue
+      for dir in env/*/; do
+        env="${dir%/}"; env="${env#env/}"
+        if grep -qE '^key[[:space:]]*=' "env/${env}/backend.hcl"; then
+          echo "env/${env}/backend.hcl pins a state key; CI sets one per stack — remove it"; fail=1
+        fi
+      done
+      [ "$fail" -eq 0 ]
+    - cd modules/config
+    - printf 'terraform {\n  backend "local" {}\n}\n' > backend_override.tf
+    - terraform init -input=false > /dev/null
+    - |
+      fail=0
+      for dir in ../../env/*/; do
+        env="$(basename "${dir%/}")"
         if [ "$(echo 'length(local.config_errors) + length(local.policy_errors)' | terraform console -var "environment=${env}")" = "0" ]; then
-          echo "${TF_ROOT}/${STACK}/${env}/config.yaml: OK"
+          echo "${TF_ROOT}/env/${env}/config.yaml: OK ($(echo 'join(", ", [for k, v in local.placement : "${k}=${v}"])' | terraform console -var "environment=${env}"))"
         else
-          echo "${TF_ROOT}/${STACK}/${env}/config.yaml is invalid or not allowed in ${env}:"
+          echo "${TF_ROOT}/env/${env}/config.yaml is invalid or not allowed in ${env}:"
           echo 'concat(local.config_errors, local.policy_errors)' | terraform console -var "environment=${env}"
           fail=1
         fi
       done
-      exit $fail
+      [ "$fail" -eq 0 ]
+    # What each environment would install on eks: the pinned chart and every release's values.
+    - |
+      mkdir -p "${CI_PROJECT_DIR}/${TF_ROOT}/helm-values"
+      echo 'local.kubernetes_version' | terraform console -var environment=dev | tr -d '"' > "${CI_PROJECT_DIR}/${TF_ROOT}/helm-values/kubernetes-version"
+      render='base64encode(jsonencode({ chart = local.chart, region = local.region, releases = { for k, r in local.release_specs : k => r.values } }))'
+      for dir in ../../env/*/; do
+        env="$(basename "${dir%/}")"
+        [ "$(echo 'length(local.release_specs)' | terraform console -var "environment=${env}")" != "0" ] || continue
+        echo "$render" | terraform console -var "environment=${env}" | tr -d '"' | base64 -d \
+          > "${CI_PROJECT_DIR}/${TF_ROOT}/helm-values/${env}.json"
+      done
+    - rm backend_override.tf
+  artifacts:
+    paths:
+      - "${TF_ROOT}/helm-values/"
+    expire_in: 1 day
 
 .tf-contract-test:
   extends: .tf-base
@@ -38,8 +69,12 @@
     name: "hashicorp/terraform:${TF_TEST_VERSION}"
     entrypoint: [""]
   script:
-    - terraform init -backend=false -input=false
-    - terraform test -no-color
+    - cd "${TF_ROOT}"
+    - |
+      for dir in modules/config $STACKS; do
+        echo "--- terraform test: ${dir}"
+        ( cd "$dir" && terraform init -backend=false -input=false > /dev/null && terraform test -no-color )
+      done
 
 .tf-aws:
   extends: .tf-base
@@ -52,19 +87,31 @@
     - printf '%s' "$AWS_OIDC_TOKEN" > /tmp/web-identity-token
     - export AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/web-identity-token
     - export AWS_ROLE_SESSION_NAME="gitlab-${CI_PROJECT_ID}-${CI_JOB_ID}"
-    - export AWS_REGION="$(sed -n 's/^region:[[:space:]]*//p' "${TF_ENV}/config.yaml" | head -1)"
+    - export AWS_REGION="$(sed -n 's/^region:[[:space:]]*//p' "../env/${TF_ENV}/config.yaml" | head -1)"
+    - export STATE_BUCKET="$(sed -n 's/^bucket[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "../env/${TF_ENV}/backend.hcl")"
+    - export STATE_REGION="$(sed -n 's/^region[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "../env/${TF_ENV}/backend.hcl")"
+    - |
+      tf_init() {
+        terraform init -input=false -reconfigure \
+          -backend-config="../env/${TF_ENV}/backend.hcl" \
+          -backend-config="key=platform/${TF_ENV}/${STACK}.tfstate"
+      }
+      tf_vars() {
+        set -- -var "environment=${TF_ENV}"
+        [ "$STACK" = "base" ] || set -- "$@" -var "base_state_bucket=${STATE_BUCKET}" -var "base_state_region=${STATE_REGION}"
+        echo "$@"
+      }
 
 .tf-plan:
   extends: .tf-aws
-  stage: plan
   variables:
     AWS_ROLE_ARN: $AWS_PLAN_ROLE_ARN
   environment:
     name: $TF_ENV
     action: prepare
   script:
-    - terraform init -input=false -reconfigure -backend-config="${TF_ENV}/backend.hcl"
-    - terraform plan -input=false -lock-timeout=5m -compact-warnings -var "environment=${TF_ENV}" -out="tfplan-${TF_ENV}" > /dev/null
+    - tf_init
+    - terraform plan -input=false -lock-timeout=5m -compact-warnings $(tf_vars) -out="tfplan-${TF_ENV}" > /dev/null
     # The log carries addresses and actions only, never attribute values; the full plan stays in the artifact.
     - terraform show -no-color "tfplan-${TF_ENV}" | grep -E '^  # |^Plan:|^No changes' || true
   artifacts:
@@ -75,11 +122,20 @@
 
 .tf-apply:
   extends: .tf-aws
-  stage: apply
   variables:
     AWS_ROLE_ARN: $AWS_APPLY_ROLE_ARN
   environment:
     name: $TF_ENV
   script:
-    - terraform init -input=false -reconfigure -backend-config="${TF_ENV}/backend.hcl"
+    - tf_init
     - terraform apply -input=false -lock-timeout=5m "tfplan-${TF_ENV}"
+    - |
+      if [ "$STACK" = "eks" ]; then
+        # The deploy job's only input: the chart, the cluster, the namespace and each release's values.
+        terraform output -json helm_deployment > "deploy-${TF_ENV}.json"
+      fi
+  artifacts:
+    paths:
+      - "${TF_ROOT}/${STACK}/deploy-${TF_ENV}.json"
+    expire_in: 1 day
+    access: developer

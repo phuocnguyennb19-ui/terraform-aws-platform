@@ -1,62 +1,66 @@
 locals {
-  rds_alarms = {
-    rds-cpu = {
-      alarm_description   = "RDS CPU above 80% for 10 minutes on ${local.name_prefix}"
-      namespace           = "AWS/RDS"
-      metric_name         = "CPUUtilization"
-      dimensions          = { DBInstanceIdentifier = "${local.name_prefix}-postgres" }
-      threshold           = 80
-      comparison_operator = "GreaterThanThreshold"
-      evaluation_periods  = 2
-      severity            = "warning"
-    }
+  # Container Insights metrics, published by the amazon-cloudwatch-observability addon.
+  eks_alarms = merge(concat([{}], [
+    for name, s in local.services : {
+      "eks-${name}-running-pods" = {
+        alarm_description = "EKS service ${name} in ${local.eks_cluster_name} is running fewer pods than its floor"
+        namespace         = "ContainerInsights"
+        metric_name       = "service_number_of_running_pods"
+        statistic         = "Minimum"
+        dimensions = {
+          ClusterName = local.eks_cluster_name
+          Namespace   = local.eks_namespace
+          Service     = name
+        }
+        threshold           = s.autoscaling ? s.min : s.replicas
+        comparison_operator = "LessThanThreshold"
+        evaluation_periods  = 2
+        treat_missing_data  = "missing"
+        severity            = "critical"
+      }
 
-    rds-free-storage = {
-      alarm_description   = "RDS free storage below 10 GiB on ${local.name_prefix}"
-      namespace           = "AWS/RDS"
-      metric_name         = "FreeStorageSpace"
-      dimensions          = { DBInstanceIdentifier = "${local.name_prefix}-postgres" }
-      threshold           = 10737418240
-      comparison_operator = "LessThanThreshold"
-      evaluation_periods  = 1
-      severity            = "critical"
+      "eks-${name}-memory" = {
+        alarm_description = "EKS service ${name} in ${local.eks_cluster_name} is above 90% of its memory limit — the next step is an OOM kill"
+        namespace         = "ContainerInsights"
+        metric_name       = "pod_memory_utilization_over_pod_limit"
+        dimensions = {
+          ClusterName = local.eks_cluster_name
+          Namespace   = local.eks_namespace
+          Service     = name
+        }
+        threshold           = 90
+        comparison_operator = "GreaterThanThreshold"
+        evaluation_periods  = 3
+        treat_missing_data  = "notBreaching"
+        severity            = "warning"
+      }
     }
+    ], [
+    for c in [local.eks_cluster_name] : {
+      eks-failed-nodes = {
+        alarm_description   = "EKS cluster ${c} has worker nodes reporting a failed condition"
+        namespace           = "ContainerInsights"
+        metric_name         = "cluster_failed_node_count"
+        statistic           = "Maximum"
+        dimensions          = { ClusterName = c }
+        threshold           = 0
+        comparison_operator = "GreaterThanThreshold"
+        evaluation_periods  = 2
+        treat_missing_data  = "notBreaching"
+        severity            = "critical"
+      }
 
-    rds-connections = {
-      alarm_description   = "RDS connection count unusually high on ${local.name_prefix}"
-      namespace           = "AWS/RDS"
-      metric_name         = "DatabaseConnections"
-      dimensions          = { DBInstanceIdentifier = "${local.name_prefix}-postgres" }
-      threshold           = 200
-      comparison_operator = "GreaterThanThreshold"
-      evaluation_periods  = 3
-      severity            = "warning"
+      eks-node-cpu = {
+        alarm_description   = "EKS cluster ${c} nodes above 80% CPU — pods will queue as Pending"
+        namespace           = "ContainerInsights"
+        metric_name         = "node_cpu_utilization"
+        dimensions          = { ClusterName = c }
+        threshold           = 80
+        comparison_operator = "GreaterThanThreshold"
+        evaluation_periods  = 3
+        treat_missing_data  = "notBreaching"
+        severity            = "warning"
+      }
     }
-  }
-
-  cache_alarms = {
-    cache-evictions = {
-      alarm_description   = "ElastiCache is evicting keys on ${local.name_prefix} — the working set no longer fits"
-      namespace           = "AWS/ElastiCache"
-      metric_name         = "Evictions"
-      statistic           = "Sum"
-      dimensions          = { ReplicationGroupId = "${local.name_prefix}-redis" }
-      threshold           = 0
-      comparison_operator = "GreaterThanThreshold"
-      evaluation_periods  = 3
-      treat_missing_data  = "notBreaching"
-      severity            = "warning"
-    }
-
-    cache-cpu = {
-      alarm_description   = "ElastiCache engine CPU above 75% on ${local.name_prefix}"
-      namespace           = "AWS/ElastiCache"
-      metric_name         = "EngineCPUUtilization"
-      dimensions          = { ReplicationGroupId = "${local.name_prefix}-redis" }
-      threshold           = 75
-      comparison_operator = "GreaterThanThreshold"
-      evaluation_periods  = 3
-      severity            = "warning"
-    }
-  }
+  ])...)
 }

@@ -1,56 +1,107 @@
 include:
   - local: ci/terraform.gitlab-ci.yml
+  - local: ci/helm.gitlab-ci.yml
 
 stages:
   - validate
+  - plan-base
+  - apply-base
   - plan
   - apply
+  - deploy
 
 variables:
   TF_VERSION: "1.5.7"
   TF_TEST_VERSION: "1.9.8"
   TF_ROOT: terraform
+  STACKS: "base ecs eks"
   TF_IN_AUTOMATION: "true"
+  HELM_IMAGE: "alpine/k8s:1.31.13"
+  HELM_TIMEOUT: 10m
+  # Schemas for the CRDs the chart renders (ExternalSecret). Mirror it if the runners have no
+  # egress to GitHub — kubeconform reads it once per job.
+  CRD_SCHEMAS: "https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json"
 
 # The branch is the environment: dev, staging and prod each have one. A push (or Run pipeline)
 # on that branch runs its environment; a merge request runs the environment of its target branch.
+# terraform/env/<env>/config.yaml decides which runtime each service lands on.
 workflow:
   rules:
     - if: $CI_MERGE_REQUEST_TARGET_BRANCH_NAME =~ /^(dev|staging|prod)$/
     - if: $CI_COMMIT_BRANCH =~ /^(dev|staging|prod)$/
 
-# terraform/ecs and terraform/eks are independent stacks with their own state. Each job runs once
-# per stack; STACK selects terraform/<stack>/, TF_ENV selects terraform/<stack>/<env>/.
-.stacks:
-  parallel:
-    matrix:
-      - STACK: [ecs, eks]
+# base builds the VPC, keys, registry, database, cache and the alarm topic once per environment.
+# ecs and eks read what it built, so an environment can run both while services move between them.
+.env-rules: &env-rules
+  - if: $CI_COMMIT_BRANCH == "dev" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev"
+    variables: { TF_ENV: dev }
+  - if: $CI_COMMIT_BRANCH == "staging" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "staging"
+    variables: { TF_ENV: staging }
+  - if: $CI_COMMIT_BRANCH == "prod" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "prod"
+    variables: { TF_ENV: prod }
 
 validate:
-  extends: [.tf-validate, .stacks]
+  extends: .tf-validate
   tags: [tf-validate-runner]
 
 contract-tests:
-  extends: [.tf-contract-test, .stacks]
+  extends: .tf-contract-test
   tags: [tf-contract-tests-runner]
 
-plan:
-  extends: [.tf-plan, .stacks]
-  tags: [tf-plan-runner]
-  rules:
-    - if: $CI_COMMIT_BRANCH == "dev" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev"
-      variables: { TF_ENV: dev }
-    - if: $CI_COMMIT_BRANCH == "staging" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "staging"
-      variables: { TF_ENV: staging }
-    - if: $CI_COMMIT_BRANCH == "prod" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "prod"
-      variables: { TF_ENV: prod }
+helm-validate:
+  extends: .helm-validate
+  tags: [tf-validate-runner]
+  needs: ["validate"]
+  rules: *env-rules
 
-# Merge request pipelines never apply: CI_COMMIT_BRANCH is unset in them.
-# needs: plan waits for both stacks' plans; each apply finds its own at terraform/<stack>/tfplan-<env>.
-apply:
-  extends: [.tf-apply, .stacks]
+plan:base:
+  extends: .tf-plan
+  stage: plan-base
+  tags: [tf-plan-runner]
+  variables:
+    STACK: base
+  rules: *env-rules
+
+# Manual like every apply. When base has nothing to change the job is a formality — it applies an
+# empty plan — but the runtime stacks below plan against whatever this leaves behind.
+apply:base:
+  extends: .tf-apply
+  stage: apply-base
   tags: [tf-apply-runner]
-  resource_group: terraform-$STACK-$TF_ENV
+  variables:
+    STACK: base
+  resource_group: terraform-$TF_ENV
+  needs: ["plan:base"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables: { TF_ENV: dev }
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "staging"
+      variables: { TF_ENV: staging }
+      when: manual
+    - if: $CI_COMMIT_BRANCH == "prod"
+      variables: { TF_ENV: prod }
+      when: manual
+
+# On a branch these run after base was applied, so they plan against the foundation that will
+# actually be there. On a merge request the apply stage is empty, so they plan against today's base.
+plan:
+  extends: .tf-plan
+  stage: plan
+  tags: [tf-plan-runner]
+  parallel:
+    matrix:
+      - STACK: [ecs, eks]
+  rules: *env-rules
+
+apply:
+  extends: .tf-apply
+  stage: apply
+  tags: [tf-apply-runner]
+  parallel:
+    matrix:
+      - STACK: [ecs, eks]
+  resource_group: terraform-$TF_ENV
   needs: ["plan"]
   rules:
     - if: $CI_COMMIT_BRANCH == "dev"
@@ -62,3 +113,19 @@ apply:
     - if: $CI_COMMIT_BRANCH == "prod"
       variables: { TF_ENV: prod }
       when: manual
+
+# Runs by itself once the eks stack is applied — that approval covers it. Without eks services it
+# exits at once. It pulls the pinned chart and reaches the EKS API: prod's endpoint is private, so
+# the tf-apply-runner must run inside the VPC.
+deploy:
+  extends: .helm-deploy
+  tags: [tf-apply-runner]
+  resource_group: terraform-$TF_ENV
+  needs: ["apply"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      variables: { TF_ENV: dev }
+    - if: $CI_COMMIT_BRANCH == "staging"
+      variables: { TF_ENV: staging }
+    - if: $CI_COMMIT_BRANCH == "prod"
+      variables: { TF_ENV: prod }

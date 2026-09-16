@@ -1,0 +1,11 @@
+environment: prod
+account_id: "444455556666"
+region: ap-southeast-1
+
+platform:
+  type: ecs
+
+services:
+  api:
+    image: api:1.4.2
+    public: true

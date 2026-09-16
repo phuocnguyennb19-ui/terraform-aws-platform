@@ -1,8 +1,0 @@
-environment: dev
-account_id: "111122223333"
-region: ap-southeast-1
-services:
-  api:
-    image: api:1.4.2
-    secrets:
-      API_KEY: arn:aws:secretsmanager:ap-southeast-1:111122223333:secret:k-AbCdEf:token::
